@@ -1,0 +1,198 @@
+name: Esinox PoC Release
+
+# Temporary oxlint 1.89.0 + feat/js-plugins-outside-script, built for esinoxc.
+# Not for production. Remove once the changes land upstream.
+
+permissions: {}
+
+on:
+  push:
+    tags:
+      - esinox-poc-*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (esinox-poc-*)
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          tag="$REF_NAME"
+          if [ "$EVENT" = "workflow_dispatch" ]; then tag="$INPUT_TAG"; fi
+          case "$tag" in
+            esinox-poc-*) ;;
+            *) echo "tag must match esinox-poc-*, got '$tag'" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64-gnu
+            build: pnpm run build-napi-release --target x86_64-unknown-linux-gnu --use-napi-cross
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64-gnu
+            build: pnpm run build-napi-release --target aarch64-unknown-linux-gnu --use-napi-cross
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+            build: pnpm run build-napi-release --target aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: darwin-x64
+            build: pnpm run build-napi-release --target x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win32-x64-msvc
+            build: pnpm run build-napi-release --target x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      # clang lacks the MSVC intrinsics mimalloc needs on windows targets.
+      TARGET_CC: ${{ !contains(matrix.target, 'pc-windows-msvc') && 'clang' || '' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - if: ${{ contains(matrix.os, 'windows') }}
+        run: git config --system core.longpaths true
+
+      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: oxc-project/setup-node@f46a72f95efdc55273fcd042d61c84e723b2892c # v1.4.1
+
+      - name: Check oxlint version
+        run: |
+          version=$(node -p "require('./npm/oxlint/package.json').version")
+          test "$version" = "1.89.0" || { echo "expected oxlint 1.89.0, got $version" >&2; exit 1; }
+
+      - name: Build oxlint native binding
+        working-directory: apps/oxlint
+        run: ${{ matrix.build }}
+
+      - name: Check binding
+        run: |
+          ls apps/oxlint/src-js/*.node
+          test -f "apps/oxlint/src-js/oxlint.${{ matrix.platform }}.node"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          if-no-files-found: error
+          name: binding-${{ matrix.platform }}
+          path: apps/oxlint/src-js/oxlint.${{ matrix.platform }}.node
+
+  package:
+    needs: [prepare, build]
+    name: Package and release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+
+      - uses: oxc-project/setup-node@f46a72f95efdc55273fcd042d61c84e723b2892c # v1.4.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: bindings
+          pattern: binding-*
+          merge-multiple: true
+
+      - name: Build oxlint JS
+        working-directory: apps/oxlint
+        run: pnpm run build-js
+
+      - name: Assemble package
+        run: |
+          rm -rf pkg && mkdir pkg
+          cp -r npm/oxlint/. pkg/
+          cp LICENSE pkg/LICENSE
+          rm -rf pkg/dist && cp -r apps/oxlint/dist pkg/dist
+          rm -f pkg/dist/*.node
+          cp bindings/*.node pkg/dist/
+          # Stock bindings must never be pulled next to ours: the JS and native
+          # callback signatures differ.
+          node -e '
+            const fs = require("node:fs");
+            const p = JSON.parse(fs.readFileSync("pkg/package.json", "utf8"));
+            delete p.optionalDependencies;
+            fs.writeFileSync("pkg/package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+          ls -la pkg/dist/*.node
+
+      - name: Pack
+        working-directory: pkg
+        run: |
+          npm pack --pack-destination ..
+          cd ..
+          mv oxlint-1.89.0.tgz oxlint-1.89.0-esinox-poc.tgz
+          sha256sum oxlint-1.89.0-esinox-poc.tgz | tee SHA256SUMS
+
+      - name: Smoke test
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke" && cd "$RUNNER_TEMP/smoke"
+          tar xzf "$GITHUB_WORKSPACE/oxlint-1.89.0-esinox-poc.tgz"
+          echo 'debugger;' > a.js
+          node package/bin/oxlint --version
+          node package/bin/oxlint a.js || true
+
+      - name: Release
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          cat > notes.md <<EOF
+          **Proof of concept, not for production.**
+
+          oxlint 1.89.0 with \`context.report({ actualRange })\`, \`context.sourceCode.actualText\` /
+          \`actualOffset\` and JS plugins running on files without \`<script>\`, built for
+          [esinoxc](https://github.com/Norbiros/esinoxc). One tarball holding native bindings for
+          linux-x64-gnu, linux-arm64-gnu, darwin-arm64, darwin-x64 and win32-x64-msvc.
+
+          \`pnpm-workspace.yaml\`:
+
+          \`\`\`yaml
+          overrides:
+            oxlint: https://github.com/${REPO}/releases/download/${TAG}/oxlint-1.89.0-esinox-poc.tgz
+          \`\`\`
+
+          \`\`\`
+          $(cat SHA256SUMS)
+          \`\`\`
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" oxlint-1.89.0-esinox-poc.tgz SHA256SUMS --clobber
+            gh release edit "$TAG" --notes-file notes.md --prerelease
+          else
+            gh release create "$TAG" oxlint-1.89.0-esinox-poc.tgz SHA256SUMS \
+              --title "$TAG" --notes-file notes.md --prerelease --latest=false \
+              --target "$GITHUB_SHA"
+          fi
